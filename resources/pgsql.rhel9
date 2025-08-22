@@ -74,6 +74,7 @@ OCF_RESKEY_xlog_check_count_default="3"
 OCF_RESKEY_crm_attr_timeout_default="5"
 OCF_RESKEY_stop_escalate_in_slave_default=90
 OCF_RESKEY_replication_slot_name_default=""
+OCF_RESKEY_external_standby_node_list_default=""
 
 : ${OCF_RESKEY_pgctl=${OCF_RESKEY_pgctl_default}}
 : ${OCF_RESKEY_psql=${OCF_RESKEY_psql_default}}
@@ -109,6 +110,7 @@ OCF_RESKEY_replication_slot_name_default=""
 : ${OCF_RESKEY_crm_attr_timeout=${OCF_RESKEY_crm_attr_timeout_default}}
 : ${OCF_RESKEY_stop_escalate_in_slave=${OCF_RESKEY_stop_escalate_in_slave_default}}
 : ${OCF_RESKEY_replication_slot_name=${OCF_RESKEY_replication_slot_name_default}}
+: ${OCF_RESKEY_external_standby_node_list=${OCF_RESKEY_external_standby_node_list_default}}
 
 usage() {
     cat <<EOF
@@ -1182,6 +1184,10 @@ control_slave_status() {
     local all_data_status
     local tmp_data_status
     local number_of_nodes
+    local target_list
+    local tmp_node_list
+    local standby_node
+    local found
 
     all_data_status=`exec_sql "${CHECK_REPLICATION_STATE_SQL}"`
     rc=$?
@@ -1256,6 +1262,36 @@ control_slave_status() {
                 ;;
         esac
     done
+
+    if [ -n "$OCF_RESKEY_external_standby_node_list" ]; then
+        for tmp_data_status in $all_data_status; do
+            found="false"
+            standby_node=`echo $tmp_data_status | cut -d "|" -f 1`
+            for target in $NODE_LIST; do
+                if [ "$standby_node" = "$target" ]; then
+                    found="true"
+                    break
+                fi
+            done
+            for target in $EXTERNAL_STANDBY_NODE_LIST; do
+                if [ "$standby_node" = "$target" ]; then
+                    found="true"
+                    break
+                fi
+            done
+            if [ "$found" = "false" ]; then
+                ocf_log debug "$standby_node is not a node to be synchronized."
+                continue
+            fi
+            if [ -n "$target_list" ]; then
+                target_list="$target_list $standby_node"
+            else
+                target_list="$standby_node"
+            fi
+        done
+        set_sync_mode "$target_list"
+    fi
+
     return 0
 }
 
@@ -1565,17 +1601,45 @@ set_async_mode() {
 }
 
 set_sync_mode() {
-    local sync_node_in_conf
-
-    sync_node_in_conf=`cat $REP_MODE_CONF | cut -d "'" -f 2`
-    if [ -n "$sync_node_in_conf" ]; then
-        ocf_log debug "$sync_node_in_conf is already sync mode."
+    local target_nodes=""
+    local target_count=0
+    local setting_node_list
+    local sorted1
+    local sorted2
+ 
+    cat $REP_MODE_CONF | cut -d "'" -f 2 | grep -q "^FIRST "
+    rc=$?
+    # FIRSTがある場合とで処理を分ける
+    if [ $rc -eq 0 ]; then
+        setting_node_list=`cat $REP_MODE_CONF | cut -d "(" -f 2 | cut -d ")" -f 1 | sed 's/[",]//g'`
     else
-        ocf_log info "Setup $1 into sync mode."
-        runasowner -q err "echo \"synchronous_standby_names = '\\\"$1\\\"'\" > \"$REP_MODE_CONF\""
-        [ "$RE_CONTROL_SLAVE" = "false" ] && RE_CONTROL_SLAVE="true"
-        exec_with_retry 0 reload_conf
+        setting_node_list=`cat $REP_MODE_CONF | cut -d "'" -f 2 | sed 's/[",]//g'`
     fi
+
+    # 設定したいノードリストと現在設定されているノードリストを比較しやすいようにソートと整形する
+    sorted1=$(echo "$1" | tr ' ' '\n' | sort)
+    sorted2=$(echo "$setting_node_list" | tr ' ' '\n' | sort)
+
+    if [ "$sorted1" = "$sorted2" ]; then
+       ocf_log debug "The same settings already exist."
+       return 0
+    fi
+
+    for node in $1; do
+        target_count=$(($target_count+1))
+        target_nodes="$target_nodes \\\"${node}\\\","
+    done
+
+    target_nodes=$(echo $target_nodes | sed 's/,$//')
+    ocf_log info "Setup $target_nodes into sync mode."
+    if [ $target_count -ge 2 ]; then
+        runasowner -q err "echo \"synchronous_standby_names = 'FIRST $target_count ($target_nodes)'\" > \"$REP_MODE_CONF\""
+    else
+        runasowner -q err "echo \"synchronous_standby_names = '$target_nodes'\" > \"$REP_MODE_CONF\""
+    fi
+
+    [ "$RE_CONTROL_SLAVE" = "false" ] && RE_CONTROL_SLAVE="true"
+    exec_with_retry 0 reload_conf
 }
 
 reload_conf() {
@@ -1950,6 +2014,10 @@ validate_ocf_check_level_10() {
 
         NODE_LIST=`echo $OCF_RESKEY_node_list | tr '[A-Z]' '[a-z]'`
         RE_CONTROL_SLAVE="false"
+
+        if [ -n "$OCF_RESKEY_external_standby_node_list" ]; then
+            EXTERNAL_STANDBY_NODE_LIST=`echo $OCF_RESKEY_external_standby_node_list | tr '[A-Z]' '[a-z]'`
+        fi
 
         if ! ocf_is_ms; then
             ocf_exit_reason "Replication(rep_mode=async or sync) requires Master/Slave configuration."
