@@ -1229,7 +1229,9 @@ control_slave_status() {
                 change_data_status "$target" "$data_status"
                 if [ "$OCF_RESKEY_rep_mode" = "sync" ]; then
                     change_master_score "$target" "$CAN_NOT_PROMOTE"
-                    set_sync_mode "$target"
+                    if [ -z "$OCF_RESKEY_external_standby_node_list" ]; then
+                        set_sync_mode "$target"
+                    fi
                 else
                     if [ $number_of_nodes -le 2 ]; then
                         change_master_score "$target" "$CAN_PROMOTE"
@@ -1248,14 +1250,14 @@ control_slave_status() {
             "DISCONNECT")
                 change_data_status "$target" "$data_status"
                 change_master_score "$target" "$CAN_NOT_PROMOTE"
-                if [ "$OCF_RESKEY_rep_mode" = "sync" ]; then
+                if [ "$OCF_RESKEY_rep_mode" = "sync" -a -z "$OCF_RESKEY_external_standby_node_list" ]; then
                     set_async_mode "$target"
                 fi
                 ;;
             *)
                 change_data_status "$target" "$data_status"
                 change_master_score "$target" "$CAN_NOT_PROMOTE"
-                if [ "$OCF_RESKEY_rep_mode" = "sync" ]; then
+                if [ "$OCF_RESKEY_rep_mode" = "sync" -a -z "$OCF_RESKEY_external_standby_node_list" ]; then
                     set_async_mode "$target"
                 fi
                 change_pgsql_status "$target" "HS:connected"
@@ -1606,6 +1608,7 @@ set_sync_mode() {
     local setting_node_list
     local sorted1
     local sorted2
+    local found
  
     cat $REP_MODE_CONF | cut -d "'" -f 2 | grep -q "^FIRST "
     rc=$?
@@ -1624,6 +1627,19 @@ set_sync_mode() {
        ocf_log debug "The same settings already exist."
        return 0
     fi
+
+    for setting_node in $setting_node_list; do
+        found="false"
+        for node in $1; do
+            # 設定済みノードが、これから設定しようとしているノードリストに存在しない ＝ つまりそれは接続が切れたということ
+            if [ $setting_node = $node ]; then
+                found="true"
+            fi
+        done
+        if [ "$found" = "false" ]; then
+            ocf_log warn "The synchronous connection from ${setting_node} was disconnected."
+        fi
+    done
 
     for node in $1; do
         target_count=$(($target_count+1))
