@@ -453,6 +453,16 @@ wal receiver is not running in the master and the attribute shows status as
 <shortdesc lang="en">check_wal_receiver</shortdesc>
 <content type="boolean" default="${OCF_RESKEY_check_wal_receiver_default}" />
 </parameter>
+
+<parameter name="external_standby_node_list" unique="0" required="0">
+<longdesc lang="en">
+All node names of nodes connecting from outside the cluster.
+Please separate each node name with a space.
+This is optional for replication. Defaults to all nodes in the cluster
+</longdesc>
+<shortdesc lang="en">external standby node list</shortdesc>
+<content type="string" default="${OCF_RESKEY_external_standby_node_list_default}" />
+</parameter>
 </parameters>
 
 <actions>
