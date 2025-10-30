@@ -1637,7 +1637,12 @@ set_sync_mode() {
             fi
         done
         if [ "$found" = "false" ]; then
-            ocf_log warn "The synchronous connection from ${setting_node} was disconnected."
+            for external_node in $OCF_RESKEY_external_standby_node_list; do
+                # Check if it's a node outside the cluster
+                if [ $setting_node = $external_node ]; then
+                    ocf_log warn "The synchronous connection from ${setting_node} was disconnected."
+                fi
+            done
         fi
     done
 
