@@ -1,0 +1,393 @@
+# pgsql RA 修正: 動的 wal_sender_timeout 調整機能の追加
+# 
+# このパッチファイルは、Pacemaker pgsql RA に以下の機能を追加します:
+# - flush_lag に基づく wal_sender_timeout の動的調整
+# - 安全係数: 10倍
+# - 段階的な値: 2秒, 5秒, 10秒, 15秒, ..., 60秒（5秒刻み）
+# - 平滑化: pgsql monitor interval 間隔で取得した、過去 3 回の flush_lag の最大値
+# - 値を上げる場合: 即座に反映
+# - 値を下げる場合: 即座に反映
+
+================================================================================
+仕様まとめ
+================================================================================
+
+新規パラメータ:
+  - adjust_wal_sender_timeout: true/false（デフォルト: false）
+
+新規ファイル:
+  - $OCF_RESKEY_tmpdir/wal_sender_timeout.conf: wal_sender_timeout の設定ファイル
+  - $OCF_RESKEY_tmpdir/flush_lag_history: 過去 3 回の flush_lag 履歴
+
+動作仕様:
+  - 安全係数: 10倍
+  - 段階的な値: 2秒、5秒、10秒、15秒、...、60秒（5秒刻み）
+  - 平滑化: 過去 3 回の flush_lag の最大値
+  - 上げる場合: 即座に反映
+  - 下げる場合: 即座に反映
+  - 対象: クラスタ内 + external_standby_node_list の全同期 Standby
+
+================================================================================
+修正1: デフォルト値の追加（約76行目付近、既存のデフォルト値定義の後に追加）
+================================================================================
+
+# 以下の行を追加:
+OCF_RESKEY_adjust_wal_sender_timeout_default="false"
+
+# 以下の行を追加（約111行目付近、既存の変数初期化の後に追加）:
+: ${OCF_RESKEY_adjust_wal_sender_timeout=${OCF_RESKEY_adjust_wal_sender_timeout_default}}
+
+================================================================================
+修正2: meta_data() 関数内にパラメータ定義を追加
+       （</parameters> タグの直前、external_standby_node_list パラメータの後に追加）
+================================================================================
+
+<parameter name="adjust_wal_sender_timeout" unique="0" required="0">
+<longdesc lang="en">
+If this is true, RA dynamically adjusts wal_sender_timeout based on
+the observed flush_lag from synchronous standby nodes.
+The adjustment uses the maximum flush_lag value multiplied by a safety
+factor of 10, then rounds up to predefined steps (2s, 5s, 10s, 15s, ...60s).
+This helps to detect synchronous standby failures more quickly while
+avoiding false positives from normal network latency variations.
+This is optional for replication with sync mode.
+</longdesc>
+<shortdesc lang="en">adjust_wal_sender_timeout</shortdesc>
+<content type="boolean" default="${OCF_RESKEY_adjust_wal_sender_timeout_default}" />
+</parameter>
+
+================================================================================
+修正3: pgsql_replication_start() 関数内に初期化処理を追加
+       （set_async_mode_all の呼び出し後、PGSQL_LOCK チェックの前に追加）
+================================================================================
+
+# 既存のコード:
+#    if ! make_recovery_conf || ! delete_xlog_location || ! set_async_mode_all; then
+#        return $OCF_ERR_GENERIC
+#    fi
+
+# 以下を追加:
+    # Initialize wal_sender_timeout adjustment files
+    if ocf_is_true ${OCF_RESKEY_adjust_wal_sender_timeout}; then
+        rm -f $WAL_SENDER_TIMEOUT_CONF $FLUSH_LAG_HISTORY_FILE
+        init_wal_sender_timeout_conf
+    fi
+
+# 既存のコード（続き）:
+#    if [ -f $PGSQL_LOCK ]; then
+
+================================================================================
+修正4: control_slave_status() 関数の末尾に wal_sender_timeout 調整処理を追加
+       （return 0 の直前に追加）
+================================================================================
+
+# 既存のコード末尾:
+#        set_sync_mode "$target_list"
+#    fi
+
+# 以下を追加:
+    # Adjust wal_sender_timeout if enabled
+    if ocf_is_true ${OCF_RESKEY_adjust_wal_sender_timeout}; then
+        max_flush_lag_ms=$(get_max_flush_lag_ms)
+        if [ -n "$max_flush_lag_ms" ] && [ "$max_flush_lag_ms" != "0" ]; then
+            adjust_wal_sender_timeout "$max_flush_lag_ms"
+        fi
+    fi
+
+# 既存のコード:
+#    return 0
+
+================================================================================
+修正5: 新しい関数群を追加（control_slave_status() 関数の後に追加）
+================================================================================
+
+#
+# Get maximum flush_lag in milliseconds from all sync standby nodes
+#
+get_max_flush_lag_ms() {
+    local output
+    local flush_lag_ms
+    local max_lag=0
+    local rc
+
+    output=`exec_sql "${CHECK_FLUSH_LAG_SQL}"`
+    rc=$?
+
+    if [ $rc -ne 0 ]; then
+        ocf_log warn "Can't get flush_lag from pg_stat_replication."
+        echo ""
+        return 1
+    fi
+
+    if [ -z "$output" ]; then
+        ocf_log debug "No sync standby nodes found for flush_lag calculation."
+        echo "0"
+        return 0
+    fi
+
+    for flush_lag_ms in $output; do
+        if [ -n "$flush_lag_ms" ] && [ "$flush_lag_ms" -gt "$max_lag" ] 2>/dev/null; then
+            max_lag=$flush_lag_ms
+        fi
+    done
+
+    ocf_log debug "Maximum flush_lag: ${max_lag}ms"
+    echo "$max_lag"
+    return 0
+}
+
+#
+# Calculate target wal_sender_timeout from flush_lag
+# Formula: flush_lag * safety_factor (10) -> round up to step values
+# Steps: 2, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60 (seconds)
+# Min: 2s, Max: 60s
+#
+calculate_wal_sender_timeout() {
+    local flush_lag_ms=$1
+    local safety_factor=10
+    local calculated_ms
+    local calculated_sec
+    local target_sec
+
+    # Calculate: flush_lag * safety_factor
+    calculated_ms=$((flush_lag_ms * safety_factor))
+    # Convert to seconds (round up)
+    calculated_sec=$(( (calculated_ms + 999) / 1000 ))
+
+    # Round up to step values: 2, 5, 10, 15, 20, ..., 60
+    if [ $calculated_sec -le 2 ]; then
+        target_sec=2
+    elif [ $calculated_sec -le 5 ]; then
+        target_sec=5
+    elif [ $calculated_sec -le 60 ]; then
+        # Round up to nearest 5 seconds
+        target_sec=$(( ((calculated_sec + 4) / 5) * 5 ))
+    else
+        target_sec=60
+    fi
+
+    echo "$target_sec"
+}
+
+#
+# Get current wal_sender_timeout value in seconds
+#
+get_current_wal_sender_timeout() {
+    local output
+    local value
+
+    # First check if we have our own conf file
+    if [ -f "$WAL_SENDER_TIMEOUT_CONF" ]; then
+        value=`grep "^wal_sender_timeout" "$WAL_SENDER_TIMEOUT_CONF" | sed "s/.*=[ ]*'\?\([0-9]*\).*/\1/"`
+        if [ -n "$value" ]; then
+            echo "$value"
+            return 0
+        fi
+    fi
+
+    # Query PostgreSQL for current value
+    output=`exec_sql "SHOW wal_sender_timeout;"`
+    if [ $? -eq 0 ] && [ -n "$output" ]; then
+        # Convert to seconds (output could be like "60s" or "60000ms" or "1min")
+        value=`echo "$output" | sed 's/[^0-9]//g'`
+        case "$output" in
+            *ms)
+                value=$((value / 1000))
+                ;;
+            *min)
+                value=$((value * 60))
+                ;;
+            *)
+                # Assume seconds or already numeric
+                ;;
+        esac
+        echo "$value"
+        return 0
+    fi
+
+    # Default value
+    echo "60"
+}
+
+#
+# Initialize wal_sender_timeout.conf with current or default value
+#
+init_wal_sender_timeout_conf() {
+    local current_timeout
+    local conf_value
+
+    # Check postgresql.conf for existing wal_sender_timeout setting
+    conf_value=`get_pgsql_param wal_sender_timeout`
+    if [ -n "$conf_value" ]; then
+        # Parse the value (could be "60s", "60000ms", "1min", etc.)
+        current_timeout=`echo "$conf_value" | sed 's/[^0-9]//g'`
+        case "$conf_value" in
+            *ms)
+                current_timeout=$((current_timeout / 1000))
+                ;;
+            *min)
+                current_timeout=$((current_timeout * 60))
+                ;;
+            *)
+                # Assume seconds
+                ;;
+        esac
+    else
+        current_timeout=60
+    fi
+
+    ocf_log info "Initializing wal_sender_timeout.conf with ${current_timeout}s"
+    runasowner "echo \"wal_sender_timeout = '${current_timeout}s'\" > \"$WAL_SENDER_TIMEOUT_CONF\""
+}
+
+#
+# Update flush_lag history file and return smoothed max value
+# History keeps last 3 max flush_lag values
+#
+update_flush_lag_history() {
+    local new_value=$1
+    local history=""
+    local smoothed_max=0
+    local count=0
+    local value
+
+    # Read existing history
+    if [ -f "$FLUSH_LAG_HISTORY_FILE" ]; then
+        history=`cat "$FLUSH_LAG_HISTORY_FILE"`
+    fi
+
+    # Add new value and keep only last 3
+    if [ -n "$history" ]; then
+        # Get last 2 values and add new one
+        history=`echo "$history" | tail -2`
+        history=$(printf "%s\n%s" "$history" "$new_value")
+    else
+        history="$new_value"
+    fi
+
+    # Write updated history
+    echo "$history" > "$FLUSH_LAG_HISTORY_FILE"
+
+    # Calculate max from history
+    for value in $history; do
+        if [ -n "$value" ] && [ "$value" -gt "$smoothed_max" ] 2>/dev/null; then
+            smoothed_max=$value
+        fi
+    done
+
+    ocf_log debug "Flush lag history: [$history], smoothed max: ${smoothed_max}ms"
+    echo "$smoothed_max"
+}
+
+#
+# Adjust wal_sender_timeout based on flush_lag
+#
+adjust_wal_sender_timeout() {
+    local flush_lag_ms=$1
+    local smoothed_lag_ms
+    local target_timeout
+    local current_timeout
+
+    # Update history and get smoothed value
+    smoothed_lag_ms=$(update_flush_lag_history "$flush_lag_ms")
+
+    # Calculate target timeout
+    target_timeout=$(calculate_wal_sender_timeout "$smoothed_lag_ms")
+
+    # Get current timeout
+    current_timeout=$(get_current_wal_sender_timeout)
+
+    ocf_log debug "wal_sender_timeout adjustment: flush_lag=${flush_lag_ms}ms, smoothed=${smoothed_lag_ms}ms, target=${target_timeout}s, current=${current_timeout}s"
+
+    if [ "$target_timeout" -ne "$current_timeout" ]; then
+        ocf_log info "Changing wal_sender_timeout: ${current_timeout}s -> ${target_timeout}s (flush_lag=${smoothed_lag_ms}ms)"
+        set_wal_sender_timeout "$target_timeout"
+    fi
+}
+
+#
+# Set wal_sender_timeout value and reload PostgreSQL
+#
+set_wal_sender_timeout() {
+    local timeout_sec=$1
+
+    runasowner "echo \"wal_sender_timeout = '${timeout_sec}s'\" > \"$WAL_SENDER_TIMEOUT_CONF\""
+    if [ $? -ne 0 ]; then
+        ocf_log err "Failed to write wal_sender_timeout.conf"
+        return 1
+    fi
+
+    exec_with_retry 0 reload_conf
+    return $?
+}
+
+================================================================================
+修正6: validate_ocf_check_level_10() 関数内に設定ファイルのinclude追加
+       （REP_MODE_CONF の include directive 追加処理の後、約2270行付近に追加）
+================================================================================
+
+# 既存のコード（rep_mode.conf の include 処理の後）:
+#            fi
+#        fi
+
+# 以下を追加:
+        # Add include directive for wal_sender_timeout.conf if adjust_wal_sender_timeout is enabled
+        if ocf_is_true ${OCF_RESKEY_adjust_wal_sender_timeout}; then
+            WAL_SENDER_TIMEOUT_CONF=${OCF_RESKEY_tmpdir}/wal_sender_timeout.conf
+            FLUSH_LAG_HISTORY_FILE=${OCF_RESKEY_tmpdir}/flush_lag_history
+
+            wal_sender_timeout_string="include '$WAL_SENDER_TIMEOUT_CONF' # added by pgsql RA"
+            if ! grep -q "^[[:space:]]*$wal_sender_timeout_string" $OCF_RESKEY_config; then
+                ocf_log info "adding include directive $wal_sender_timeout_string into $OCF_RESKEY_config"
+                echo "$wal_sender_timeout_string" >> $OCF_RESKEY_config
+            fi
+
+            # Define SQL for getting flush_lag
+            CHECK_FLUSH_LAG_SQL="SELECT COALESCE(EXTRACT(EPOCH FROM flush_lag) * 1000, 0)::bigint FROM pg_stat_replication WHERE sync_state = 'sync'"
+        fi
+
+================================================================================
+修正7: グローバル変数の初期化（validate_ocf_check_level_10() 関数内、
+       is_replication ブロック内で変数を初期化する部分、約2220行付近）
+================================================================================
+
+# 既存のコード（is_replication ブロック内、CHECK_REPLICATION_STATE_SQL 定義の後）:
+#        CHECK_REPLICATION_STATE_SQL="select application_name,upper(state),upper(sync_state) from pg_stat_replication"
+
+# 以下を追加（adjust_wal_sender_timeout 用の変数定義）:
+        # Variables for wal_sender_timeout adjustment
+        WAL_SENDER_TIMEOUT_CONF=""
+        FLUSH_LAG_HISTORY_FILE=""
+        CHECK_FLUSH_LAG_SQL=""
+
+================================================================================
+完全な修正済みファイルの概要
+================================================================================
+
+以下のファイルが新規作成/変更されます:
+
+1. $OCF_RESKEY_tmpdir/wal_sender_timeout.conf
+   - wal_sender_timeout の設定を格納
+   - 例: wal_sender_timeout = '5s'
+
+2. $OCF_RESKEY_tmpdir/flush_lag_history  
+   - 過去3回の flush_lag 最大値を格納（1行に1つの値）
+
+================================================================================
+動作確認のポイント
+================================================================================
+
+1. パラメータ設定:
+   adjust_wal_sender_timeout="true" を リソース定義に追加
+
+2. ログ確認:
+   - "Initializing wal_sender_timeout.conf with XXs" - 初期化時
+   - "wal_sender_timeout adjustment:" - 毎回の調整計算
+   - "Changing wal_sender_timeout:" - 値を変更する時
+
+3. ファイル確認:
+   cat $tmpdir/wal_sender_timeout.conf
+   cat $tmpdir/flush_lag_history
+
+4. PostgreSQL 設定確認:
+   SHOW wal_sender_timeout;
