@@ -465,7 +465,6 @@ This is optional for replication. Defaults to all nodes in the cluster
 <shortdesc lang="en">external standby node list</shortdesc>
 <content type="string" default="${OCF_RESKEY_external_standby_node_list_default}" />
 </parameter>
-</parameters>
 
 <parameter name="adjust_wal_sender_timeout" unique="0" required="0">
 <longdesc lang="en">
@@ -480,6 +479,7 @@ This is optional for replication with sync mode.
 <shortdesc lang="en">adjust_wal_sender_timeout</shortdesc>
 <content type="boolean" default="${OCF_RESKEY_adjust_wal_sender_timeout_default}" />
 </parameter>
+</parameters>
 
 <actions>
 <action name="start" timeout="120s" />
