@@ -25,7 +25,8 @@ Pacemaker pgsql Resource Agent に、`flush_lag` に基づく `wal_sender_timeou
 
 ```
 target = max(過去5回のflush_lag) × 4
-最終値 = max(10秒, min(60秒, target))
+下限値 = monitor_interval + 1秒
+最終値 = max(下限値, min(60秒, target))
 ```
 
 ### パラメータ値
@@ -33,12 +34,12 @@ target = max(過去5回のflush_lag) × 4
 | 項目 | 値 | 根拠 |
 |------|-----|------|
 | 安全係数 | 4倍 | RFC 6298 (TCP RTO) の K 値 |
-| 下限値 | 10秒 | monitor interval (9秒) より大きい値 |
+| 下限値 | monitor_interval + 1秒 | monitor interval より大きい値を動的に計算 |
 | 上限値 | 60秒 | PostgreSQL デフォルト値 |
 | 履歴サンプル数 | 5回 | 平滑化のため |
-| ステップ値 | 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60秒 | 5秒刻み |
+| ステップ値 | 下限値, 下限値+5, 下限値+10, ...（5秒刻み、最大60秒） | 動的に計算 |
 
-### 計算例
+### 計算例（monitor_interval = 9秒、下限値 = 10秒 の場合）
 
 | flush_lag (最大値) | 計算 | 結果 |
 |-------------------|------|------|
@@ -51,6 +52,16 @@ target = max(過去5回のflush_lag) × 4
 | 10000ms | 10000 × 4 = 40000ms | 40秒 |
 | 15000ms | 15000 × 4 = 60000ms | 60秒 |
 | 20000ms | 20000 × 4 = 80000ms | 60秒（上限） |
+
+### 計算例（monitor_interval = 19秒、下限値 = 20秒 の場合）
+
+| flush_lag (最大値) | 計算 | 結果 |
+|-------------------|------|------|
+| 100ms | 100 × 4 = 400ms | 20秒（下限） |
+| 2500ms | 2500 × 4 = 10000ms | 20秒（下限） |
+| 5000ms | 5000 × 4 = 20000ms | 20秒 |
+| 6000ms | 6000 × 4 = 24000ms | 25秒 |
+| 10000ms | 10000 × 4 = 40000ms | 40秒 |
 
 ### 動作仕様
 
@@ -70,9 +81,11 @@ target = max(過去5回のflush_lag) × 4
 
 RFC 6298 で定義された TCP の再送タイムアウト（RTO）計算式において、安全係数 K = 4 が採用されています。この値は長年の TCP 運用実績に基づいており、ネットワーク遅延の変動を考慮した標準的な値です。
 
-### 下限値 = 10秒 の根拠
+### 下限値 = monitor_interval + 1秒 の根拠
 
-Pacemaker の monitor interval（9秒）より大きい値を設定する必要があります。`wal_sender_timeout` が monitor interval より小さい場合、遅延の急増時に調整が間に合わず、Standby が切断される可能性があります。
+Pacemaker の monitor interval より大きい値を設定する必要があります。`wal_sender_timeout` が monitor interval より小さい場合、遅延の急増時に調整が間に合わず、Standby が切断される可能性があります。
+
+`OCF_RESKEY_CRM_meta_interval` 環境変数を使用することで、Pacemaker が設定した monitor interval を動的に取得し、適切な下限値を自動計算します。
 
 ### 履歴サンプル数 = 5 の根拠
 
@@ -108,7 +121,8 @@ OCF_RESKEY_adjust_wal_sender_timeout_default="false"
 If this is true, RA dynamically adjusts wal_sender_timeout based on
 the observed flush_lag from synchronous standby nodes.
 The adjustment uses the formula: max(flush_lag) * 4 (safety factor from RFC 6298),
-then rounds up to predefined steps (10s, 15s, 20s, ...60s).
+then rounds up to predefined steps.
+The minimum value is dynamically calculated as monitor_interval + 1 second.
 This helps to detect synchronous standby failures more quickly while
 avoiding false positives from normal network latency variations.
 This is optional for replication with sync mode.
@@ -203,8 +217,7 @@ flush_lag から目標の wal_sender_timeout を計算する。
 #
 # Calculate target wal_sender_timeout from flush_lag.
 # Formula: flush_lag * safety_factor (4, from RFC 6298) -> round up to step values.
-# Steps: 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60 (seconds).
-# Min: 10s, Max: 60s.
+# Min: monitor_interval + 1 second (dynamic), Max: 60s.
 #
 calculate_wal_sender_timeout() {
     local flush_lag_ms=$1
@@ -213,17 +226,27 @@ calculate_wal_sender_timeout() {
     local calculated_sec
     local target_sec
 
+    # Get monitor interval from Pacemaker environment variable (in milliseconds)
+    # Default to 9000ms (9 seconds) if not set
+    local monitor_interval_ms=${OCF_RESKEY_CRM_meta_interval:-9000}
+    local monitor_interval_sec=$((monitor_interval_ms / 1000))
+    local min_timeout=$((monitor_interval_sec + 1))
+
     # Calculate: flush_lag * safety_factor
     calculated_ms=$((flush_lag_ms * safety_factor))
     # Convert to seconds (round up)
     calculated_sec=$(( (calculated_ms + 999) / 1000 ))
 
-    # Round up to step values: 10, 15, 20, ..., 60
-    if [ $calculated_sec -le 10 ]; then
-        target_sec=10
+    # Apply minimum and maximum limits, then round up to nearest 5 seconds
+    if [ $calculated_sec -le $min_timeout ]; then
+        target_sec=$min_timeout
     elif [ $calculated_sec -le 60 ]; then
         # Round up to nearest 5 seconds
         target_sec=$(( ((calculated_sec + 4) / 5) * 5 ))
+        # Ensure at least min_timeout
+        if [ $target_sec -lt $min_timeout ]; then
+            target_sec=$min_timeout
+        fi
     else
         target_sec=60
     fi
