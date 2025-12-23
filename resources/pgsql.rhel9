@@ -470,8 +470,8 @@ This is optional for replication. Defaults to all nodes in the cluster
 <longdesc lang="en">
 If this is true, RA dynamically adjusts wal_sender_timeout based on
 the observed flush_lag from synchronous standby nodes.
-The adjustment uses the maximum flush_lag value multiplied by a safety
-factor of 10, then rounds up to predefined steps (2s, 5s, 10s, 15s, ...60s).
+The adjustment uses the formula: max(flush_lag) * 4 (safety factor from RFC 6298),
+then rounds up to predefined steps (10s, 15s, 20s, ...60s).
 This helps to detect synchronous standby failures more quickly while
 avoiding false positives from normal network latency variations.
 This is optional for replication with sync mode.
@@ -1338,7 +1338,7 @@ control_slave_status() {
 }
 
 #
-# Get maximum flush_lag in milliseconds from all sync standby nodes
+# Get maximum flush_lag in milliseconds from all sync standby nodes.
 #
 get_max_flush_lag_ms() {
     local output
@@ -1373,20 +1373,20 @@ get_max_flush_lag_ms() {
 }
 
 #
-# Calculate target wal_sender_timeout from flush_lag
-# Steps: 10, 15, 20, ..., 60 (seconds)
-# Min: 10s, Max: 60s
+# Calculate target wal_sender_timeout from flush_lag.
+# Formula: flush_lag * safety_factor (4, from RFC 6298) -> round up to step values.
+# Steps: 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60 (seconds).
+# Min: 10s, Max: 60s.
 #
 calculate_wal_sender_timeout() {
     local flush_lag_ms=$1
-    local safety_factor=5
-    local fixed_margin_ms=5000
+    local safety_factor=4
     local calculated_ms
     local calculated_sec
     local target_sec
 
-    # Calculate: flush_lag * safety_factor + fixed_margin
-    calculated_ms=$((flush_lag_ms * safety_factor + fixed_margin_ms))
+    # Calculate: flush_lag * safety_factor
+    calculated_ms=$((flush_lag_ms * safety_factor))
     # Convert to seconds (round up)
     calculated_sec=$(( (calculated_ms + 999) / 1000 ))
 
@@ -1404,7 +1404,7 @@ calculate_wal_sender_timeout() {
 }
 
 #
-# Get current wal_sender_timeout value in seconds
+# Get current wal_sender_timeout value in seconds.
 #
 get_current_wal_sender_timeout() {
     local output
@@ -1444,7 +1444,7 @@ get_current_wal_sender_timeout() {
 }
 
 #
-# Initialize wal_sender_timeout.conf with current or default value
+# Initialize wal_sender_timeout.conf with current or default value.
 #
 init_wal_sender_timeout_conf() {
     local current_timeout
@@ -1475,14 +1475,13 @@ init_wal_sender_timeout_conf() {
 }
 
 #
-# Update flush_lag history file and return smoothed max value
-# History keeps last 3 max flush_lag values
+# Update flush_lag history file and return smoothed max value.
+# History keeps last 5 max flush_lag values.
 #
 update_flush_lag_history() {
     local new_value=$1
     local history=""
     local smoothed_max=0
-    local count=0
     local value
 
     # Read existing history
@@ -1490,10 +1489,10 @@ update_flush_lag_history() {
         history=`cat "$FLUSH_LAG_HISTORY_FILE"`
     fi
 
-    # Add new value and keep only last 3
+    # Add new value and keep only last 5
     if [ -n "$history" ]; then
-        # Get last 2 values and add new one
-        history=`echo "$history" | tail -2`
+        # Get last 4 values and add new one
+        history=`echo "$history" | tail -4`
         history=$(printf "%s\n%s" "$history" "$new_value")
     else
         history="$new_value"
@@ -1514,7 +1513,7 @@ update_flush_lag_history() {
 }
 
 #
-# Adjust wal_sender_timeout based on flush_lag
+# Adjust wal_sender_timeout based on flush_lag.
 #
 adjust_wal_sender_timeout() {
     local flush_lag_ms=$1
@@ -1540,7 +1539,7 @@ adjust_wal_sender_timeout() {
 }
 
 #
-# Set wal_sender_timeout value and reload PostgreSQL
+# Set wal_sender_timeout value and reload PostgreSQL.
 #
 set_wal_sender_timeout() {
     local timeout_sec=$1
