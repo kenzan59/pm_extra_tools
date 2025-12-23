@@ -19,7 +19,19 @@ Pacemaker pgsql Resource Agent に、`flush_lag` に基づく `wal_sender_timeou
 | ファイルパス | 説明 |
 |-------------|------|
 | `$OCF_RESKEY_tmpdir/wal_sender_timeout.conf` | wal_sender_timeout の設定ファイル |
-| `$OCF_RESKEY_tmpdir/flush_lag_history` | 過去 5 回の flush_lag 履歴 |
+| `$OCF_RESKEY_tmpdir/flush_lag_history` | 過去 5 回の flush_lag 履歴（タイムスタンプ付き） |
+
+### 履歴ファイルの形式
+
+```
+2024-12-23T11:24:20 4005
+2024-12-23T11:24:30 4
+2024-12-23T11:30:12 6
+2024-12-23T11:30:21 6
+2024-12-23T11:30:30 0
+```
+
+各行は `タイムスタンプ flush_lag値（ミリ秒）` の形式です。
 
 ### 計算式
 
@@ -70,8 +82,23 @@ target = max(過去5回のflush_lag) × 4
 | 平滑化 | 過去 5 回の flush_lag の最大値 |
 | 値を上げる場合 | 即座に反映 |
 | 値を下げる場合 | 即座に反映 |
-| flush_lag が NULL の場合 | 調整しない（前回値を維持） |
+| flush_lag が NULL の場合 | 履歴に 0 を追加し、徐々に下限値へ近づける |
 | 対象 | クラスタ内 + external_standby_node_list の全同期 Standby |
+
+### flush_lag が NULL の場合の動作
+
+flush_lag が NULL（Standby が完全に追いついている状態）の場合、履歴に 0 を追加します。これにより、一時的なスパイクがあっても、その後通信が安定すれば徐々に下限値に戻ります。
+
+動作例（履歴サンプル数 = 5、下限値 = 10秒）：
+
+| 回数 | 履歴 | max | wal_sender_timeout |
+|------|------|-----|-------------------|
+| 初期 | 4, 6, 6, 4005, 6 | 4005 | 20秒 |
+| NULL 1回目 | 6, 6, 4005, 6, 0 | 4005 | 20秒 |
+| NULL 2回目 | 6, 4005, 6, 0, 0 | 4005 | 20秒 |
+| NULL 3回目 | 4005, 6, 0, 0, 0 | 4005 | 20秒 |
+| NULL 4回目 | 6, 0, 0, 0, 0 | 6 | 10秒（下限） |
+| NULL 5回目 | 0, 0, 0, 0, 0 | 0 | 10秒（下限） |
 
 ---
 
@@ -90,6 +117,10 @@ Pacemaker の monitor interval より大きい値を設定する必要があり�
 ### 履歴サンプル数 = 5 の根拠
 
 短期的なスパイクによる過剰反応を防ぎつつ、遅延の傾向を適切に捉えるためのバランスを考慮しました。
+
+### flush_lag が NULL の場合に 0 を追加する根拠
+
+flush_lag が NULL の状態が続く場合、レプリケーションが快適であることを意味します。履歴に 0 を追加することで、過去のスパイクを徐々に履歴から押し出し、下限値に近づけます。これにより、一時的な遅延増加後も適切に回復できます。
 
 ---
 
@@ -156,7 +187,7 @@ This is optional for replication with sync mode.
     # Adjust wal_sender_timeout if enabled
     if ocf_is_true ${OCF_RESKEY_adjust_wal_sender_timeout}; then
         max_flush_lag_ms=$(get_max_flush_lag_ms)
-        if [ -n "$max_flush_lag_ms" ] && [ "$max_flush_lag_ms" != "0" ]; then
+        if [ -n "$max_flush_lag_ms" ]; then
             adjust_wal_sender_timeout "$max_flush_lag_ms"
         fi
     fi
@@ -175,6 +206,7 @@ This is optional for replication with sync mode.
 ```bash
 #
 # Get maximum flush_lag in milliseconds from all sync standby nodes.
+# Returns "0" if flush_lag is NULL (standby is fully caught up).
 #
 get_max_flush_lag_ms() {
     local output
@@ -182,7 +214,7 @@ get_max_flush_lag_ms() {
     local max_lag=0
     local rc
 
-    output=`exec_sql "${CHECK_FLUSH_LAG_SQL}"`
+    output=$(exec_sql "${CHECK_FLUSH_LAG_SQL}")
     rc=$?
 
     if [ $rc -ne 0 ]; then
@@ -269,7 +301,7 @@ get_current_wal_sender_timeout() {
 
     # First check if we have our own conf file
     if [ -f "$WAL_SENDER_TIMEOUT_CONF" ]; then
-        value=`grep "^wal_sender_timeout" "$WAL_SENDER_TIMEOUT_CONF" | sed "s/.*=[ ]*'\?\([0-9]*\).*/\1/"`
+        value=$(grep "^wal_sender_timeout" "$WAL_SENDER_TIMEOUT_CONF" | sed "s/.*=[ ]*'\?\([0-9]*\).*/\1/")
         if [ -n "$value" ]; then
             echo "$value"
             return 0
@@ -277,10 +309,10 @@ get_current_wal_sender_timeout() {
     fi
 
     # Query PostgreSQL for current value
-    output=`exec_sql "SHOW wal_sender_timeout;"`
+    output=$(exec_sql "SHOW wal_sender_timeout;")
     if [ $? -eq 0 ] && [ -n "$output" ]; then
         # Convert to seconds (output could be like "60s" or "60000ms" or "1min")
-        value=`echo "$output" | sed 's/[^0-9]//g'`
+        value=$(echo "$output" | sed 's/[^0-9]//g')
         case "$output" in
             *ms)
                 value=$((value / 1000))
@@ -314,10 +346,10 @@ init_wal_sender_timeout_conf() {
     local conf_value
 
     # Check postgresql.conf for existing wal_sender_timeout setting
-    conf_value=`get_pgsql_param wal_sender_timeout`
+    conf_value=$(get_pgsql_param wal_sender_timeout)
     if [ -n "$conf_value" ]; then
         # Parse the value (could be "60s", "60000ms", "1min", etc.)
-        current_timeout=`echo "$conf_value" | sed 's/[^0-9]//g'`
+        current_timeout=$(echo "$conf_value" | sed 's/[^0-9]//g')
         case "$conf_value" in
             *ms)
                 current_timeout=$((current_timeout / 1000))
@@ -345,39 +377,44 @@ flush_lag 履歴ファイルを更新し、平滑化された最大値を返す�
 ```bash
 #
 # Update flush_lag history file and return smoothed max value.
-# History keeps last 5 max flush_lag values.
+# History keeps last 5 flush_lag values with timestamps.
+# Format: "YYYY-MM-DDTHH:MM:SS value_in_ms" per line.
 #
 update_flush_lag_history() {
     local new_value=$1
     local history=""
     local smoothed_max=0
     local value
+    local timestamp
+
+    # Get current timestamp
+    timestamp=$(date '+%Y-%m-%dT%H:%M:%S')
 
     # Read existing history
     if [ -f "$FLUSH_LAG_HISTORY_FILE" ]; then
-        history=`cat "$FLUSH_LAG_HISTORY_FILE"`
+        history=$(cat "$FLUSH_LAG_HISTORY_FILE")
     fi
 
     # Add new value and keep only last 5
     if [ -n "$history" ]; then
-        # Get last 4 values and add new one
-        history=`echo "$history" | tail -4`
-        history=$(printf "%s\n%s" "$history" "$new_value")
+        # Get last 4 lines and add new one
+        history=$(echo "$history" | tail -4)
+        history=$(printf "%s\n%s %s" "$history" "$timestamp" "$new_value")
     else
-        history="$new_value"
+        history="$timestamp $new_value"
     fi
 
     # Write updated history
     echo "$history" > "$FLUSH_LAG_HISTORY_FILE"
 
-    # Calculate max from history
-    for value in $history; do
+    # Calculate max from history (second column)
+    for value in $(echo "$history" | awk '{print $2}'); do
         if [ -n "$value" ] && [ "$value" -gt "$smoothed_max" ] 2>/dev/null; then
             smoothed_max=$value
         fi
     done
 
-    ocf_log debug "Flush lag history: [$history], smoothed max: ${smoothed_max}ms"
+    ocf_log debug "Flush lag history updated, smoothed max: ${smoothed_max}ms"
     echo "$smoothed_max"
 }
 ```
@@ -506,6 +543,15 @@ grep -E "(wal_sender_timeout|flush_lag)" /var/log/messages | tail -50
 ```bash
 cat /var/lib/pgsql/tmp/wal_sender_timeout.conf
 cat /var/lib/pgsql/tmp/flush_lag_history
+```
+
+履歴ファイルの出力例：
+```
+2024-12-23T11:24:20 4005
+2024-12-23T11:24:30 4
+2024-12-23T11:30:12 6
+2024-12-23T11:30:21 6
+2024-12-23T11:30:30 0
 ```
 
 ### PostgreSQL 設定確認
