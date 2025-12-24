@@ -411,7 +411,7 @@ Phi-Accrual はハートビート到着間隔が正規分布に従うことを�
 | ファイルパス | 説明 |
 |-------------|------|
 | `$OCF_RESKEY_tmpdir/wal_sender_timeout.conf` | wal_sender_timeout の設定ファイル |
-| `$OCF_RESKEY_tmpdir/flush_lag_history` | 過去 5 回の flush_lag 履歴（タイムスタンプ付き） |
+| `$OCF_RESKEY_tmpdir/flush_lag_history` | 直近 5 回の flush_lag 履歴（タイムスタンプ付き） |
 
 ### 5.3. 履歴ファイルの形式
 
@@ -929,7 +929,6 @@ cat /var/lib/pgsql/tmp/flush_lag_history
   - https://www.postgresql.org/docs/current/monitoring-stats.html#MONITORING-PG-STAT-REPLICATION
 
 - PostgreSQL Source Code: walsender.c
-  - wal_sender_timeout の動作詳細
 
 - Database Internals, Chapter 9: Failure Detection
   - Phi-Accrual Failure Detector の解説
