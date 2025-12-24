@@ -882,12 +882,12 @@ cat /var/lib/pgsql/tmp/flush_lag_history
 ### その他の有益なコマンド
 
 ```bash
-# tc コマンドによる遅延（例では 2000ms）の挿入
-tc qdisc add dev eth2 root netem delay 2000ms
+# tc コマンドによる遅延（例では 3000ms）の挿入
+tc qdisc add dev eth2 root netem delay 3000ms
 
 # tc コマンドの設定確認
 tc qdisc show dev eth2
-qdisc netem 8003: root refcnt 2 limit 1000 delay 2s
+qdisc netem 8003: root refcnt 2 limit 1000 delay 3s
 
 # tc コマンドによる遅延の削除
 tc qdisc del dev eth2 root
