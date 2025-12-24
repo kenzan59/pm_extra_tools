@@ -470,7 +470,7 @@ This is optional for replication. Defaults to all nodes in the cluster
 <longdesc lang="en">
 If this is true, RA dynamically adjusts wal_sender_timeout based on
 the observed flush_lag from synchronous standby nodes.
-The adjustment uses the formula: max(flush_lag) * 4 (safety factor from RFC 6298),
+The adjustment uses the formula: max(flush_lag) * 4 (safety factor),
 then rounds up to predefined steps.
 The minimum value is dynamically calculated as monitor_interval + 1 second.
 This helps to detect synchronous standby failures more quickly while
@@ -1376,7 +1376,7 @@ get_max_flush_lag_ms() {
 
 #
 # Calculate target wal_sender_timeout from flush_lag.
-# Formula: flush_lag * safety_factor (4, from RFC 6298) -> round up to step values.
+# Formula: flush_lag * safety_factor (4) -> round up to step values.
 # Min: monitor_interval + 1 second (dynamic), Max: 60s.
 #
 calculate_wal_sender_timeout() {
