@@ -148,7 +148,7 @@ pgsql RA は `pg_ctl reload` を実行し、設定変更を PostgreSQL に反映
 Standby 障害が発生してから、同期レプリケーション構成が変更されるまでの時間は以下の要素で構成されます。
 
 ```
-障害検知時間 ≦ wal_sender_timeout + monitor interval
+wal_sender_timeout ≦ 障害検知時間 ≦ wal_sender_timeout + monitor interval
 ```
 
 | 要素 | 説明 | 設定例 |
