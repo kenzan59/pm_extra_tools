@@ -1329,6 +1329,8 @@ control_slave_status() {
 
     # Adjust wal_sender_timeout if enabled
     if ocf_is_true ${OCF_RESKEY_adjust_wal_sender_timeout}; then
+        # debug log : view OCF_RESKEY_CRM_meta_interval value according to OCF_ACTION value
+        ocf_log info "DEBUG: __OCF_ACTION=$__OCF_ACTION, CRM_meta_interval=${OCF_RESKEY_CRM_meta_interval:-UNSET}"
         max_flush_lag_ms=$(get_max_flush_lag_ms)
         if [ -n "$max_flush_lag_ms" ]; then
             adjust_wal_sender_timeout "$max_flush_lag_ms"
