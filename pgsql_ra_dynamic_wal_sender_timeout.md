@@ -280,7 +280,7 @@ Standby が完全に追いついており、新しい WAL 送信がない場合�
 
 ```
 [1] 今回の flush_lag 代表値 = max(各同期 Standby ノードの flush_lag の値)
-[2] 途中値 = max（今回の flush_lag 代表値, 過去 4 回の flush_lag 代表値） × 安全係数
+[2] 途中値 = max（今回の flush_lag 代表値, 過去 2 回の flush_lag 代表値） × 安全係数
 [3] 最終値 = max（下限値, min（上限値, 途中値））
 [4] 最終値をステップ値（下限値, 下限値 + 5, 下限値 + 10, ...（5 秒刻み）、上限値））に変換
 [5] wal_sender_timeout = ステップ値
@@ -288,9 +288,9 @@ Standby が完全に追いついており、新しい WAL 送信がない場合�
 
 ### 3.2 安全係数
 
-安全係数は 4 としました。導出過程は以下の通りです。
+安全係数は 2 としました。
 
-#### ステップ 1: flush_lag から RTT への変換（× 2）
+#### flush_lag から RTT への変換（× 2）
 
 `flush_lag` と RTT の関係は以下の通りです。
 
@@ -307,24 +307,11 @@ RTT ≒ flush_lag + 帰りのネットワーク遅延 < flush_lag × 2
 
 したがって、`flush_lag × 2` を RTT の上限値として設定しました。
 
-#### ステップ 2: ARP 再解決への備え（× 2）
-
-ネットワーク通信では、ARP（Address Resolution Protocol）キャッシュが失効した場合、ARP 要求・応答の RTT が追加で発生します。
-
-| 状況 | 説明 |
-|------|------|
-| ARP キャッシュ有効時 | 通常の RTT のみ |
-| ARP キャッシュ失効時 | ARP RTT + 通常の RTT |
-
-ARP キャッシュが失効するケース：
-- ネットワーク障害からの復旧時
-- 長時間のアイドル状態後（Linux デフォルト: 約 30〜60 秒で stale 状態に移行）
-
-最悪ケースを考慮し、さらに 2 倍のマージンを確保しました。
+なお、定期的に WAL あるいは keepalive の送受信がなされるため、ARP キャッシュ失効への考慮は不要と判断しました。
 
 ### 3.3 履歴サンプル数
 
-検討の余地はありますが、5 としました。今回の値と、過去 4 回の履歴をサンプルとしました。
+3 としました。今回の値と、過去 2 回の履歴をサンプルとしました。
 
 ### 3.4 下限値
 
@@ -344,31 +331,29 @@ PostgreSQL のデフォルト値である 60 秒を採用しました。
 
 | flush_lag (最大値) | 計算 | 結果 |
 |-------------------|------|------|
-| 100ms | 100 × 4 = 400ms | 10秒（下限） |
-| 500ms | 500 × 4 = 2000ms | 10秒（下限） |
-| 1000ms | 1000 × 4 = 4000ms | 10秒（下限） |
-| 2500ms | 2500 × 4 = 10000ms | 10秒 |
-| 3000ms | 3000 × 4 = 12000ms | 15秒 |
-| 5000ms | 5000 × 4 = 20000ms | 20秒 |
-| 10000ms | 10000 × 4 = 40000ms | 40秒 |
-| 15000ms | 15000 × 4 = 60000ms | 60秒 |
-| 20000ms | 20000 × 4 = 80000ms | 60秒（上限） |
+| 1000ms | 1000 × 2 = 2000ms | 10秒（下限） |
+| 2500ms | 2500 × 2 = 5000ms | 10秒（下限） |
+| 3000ms | 3000 × 2 = 6000ms | 10秒（下限） |
+| 5000ms | 5000 × 2 = 10000ms | 10秒 |
+| 10000ms | 10000 × 2 = 20000ms | 20秒 |
+| 15000ms | 15000 × 2 = 30000ms | 30秒 |
+| 20000ms | 20000 × 2 = 40000ms | 40秒 |
+| 30000ms | 30000 × 2 = 60000ms | 60秒 |
+| 35000ms | 35000 × 2 = 70000ms | 60秒（上限） |
 
 ### 3.7 flush_lag が NULL である場合の動作
 
 flush_lag が NULL（Standby が完全に追いついている状態）の場合、履歴に 0 を追加します。
 これにより、一時的なスパイクがあっても、その後通信が安定すれば徐々に下限値に戻ります。
 
-#### 動作例（履歴サンプル数 = 5、下限値 = 10秒）
+#### 動作例（履歴サンプル数 = 3、下限値 = 10秒）
 
 | 回数 | 履歴 | max | wal_sender_timeout |
 |------|------|-----|-------------------|
-| 初期 | 4, 6, 6, 4005, 6 | 4005 | 20秒 |
-| NULL 1 回目 | 6, 6, 4005, 6, 0 | 4005 | 20秒 |
-| NULL 2 回目 | 6, 4005, 6, 0, 0 | 4005 | 20秒 |
-| NULL 3 回目 | 4005, 6, 0, 0, 0 | 4005 | 20秒 |
-| NULL 4 回目 | 6, 0, 0, 0, 0 | 6 | 10秒（下限） |
-| NULL 5 回目 | 0, 0, 0, 0, 0 | 0 | 10秒（下限） |
+| 初期 | 4, 4005, 6 | 4005 | 10秒 |
+| NULL 1 回目 | 4005, 6, 0 | 4005 | 10秒 |
+| NULL 2 回目 | 6, 0, 0 | 6 | 10秒（下限） |
+| NULL 3 回目 | 0, 0, 0 | 0 | 10秒（下限） |
 
 ---
 
@@ -411,7 +396,7 @@ Phi-Accrual はハートビート到着間隔が正規分布に従うことを�
 | ファイルパス | 説明 |
 |-------------|------|
 | `$OCF_RESKEY_tmpdir/wal_sender_timeout.conf` | wal_sender_timeout の設定ファイル |
-| `$OCF_RESKEY_tmpdir/flush_lag_history` | 直近 5 回の flush_lag 履歴（タイムスタンプ付き） |
+| `$OCF_RESKEY_tmpdir/flush_lag_history` | 直近 3 回の flush_lag 履歴（タイムスタンプ付き） |
 
 ### 5.3. 履歴ファイルの形式
 
@@ -421,8 +406,6 @@ Phi-Accrual はハートビート到着間隔が正規分布に従うことを�
 2024-12-23T11:24:20 4005
 2024-12-23T11:24:30 4
 2024-12-23T11:30:12 6
-2024-12-23T11:30:21 6
-2024-12-23T11:30:30 0
 ```
 
 ### 5.4 動作フロー
@@ -438,7 +421,7 @@ Phi-Accrual はハートビート到着間隔が正規分布に従うことを�
         ↓
 [flush_lag_history ファイルを更新]
         ↓
-[（今回の分を含めた）過去 5 回の最大値を計算]
+[（今回の分を含めた）過去 3 回の最大値を計算]
         ↓
 [wal_sender_timeout を計算]
         ↓
@@ -476,11 +459,12 @@ OCF_RESKEY_adjust_wal_sender_timeout_default="false"
 <longdesc lang="en">
 If this is true, RA dynamically adjusts wal_sender_timeout based on
 the observed flush_lag from synchronous standby nodes.
-The adjustment uses the formula: max(flush_lag) * 4 (safety factor),
+The adjustment uses the formula: max(flush_lag) * 2 (safety factor),
 then rounds up to predefined steps.
 The minimum value is dynamically calculated as monitor_interval + 1 second.
 This helps to detect synchronous standby failures more quickly while
 avoiding false positives from normal network latency variations.
+This adjustment is performed only during monitor operations.
 This is optional for replication with sync mode.
 </longdesc>
 <shortdesc lang="en">adjust_wal_sender_timeout</shortdesc>
@@ -509,11 +493,13 @@ This is optional for replication with sync mode.
 **場所**: `return 0` の直前
 
 ```bash
-    # Adjust wal_sender_timeout if enabled
+    # Adjust wal_sender_timeout if enabled (only during monitor operation)
     if ocf_is_true ${OCF_RESKEY_adjust_wal_sender_timeout}; then
-        max_flush_lag_ms=$(get_max_flush_lag_ms)
-        if [ -n "$max_flush_lag_ms" ]; then
-            adjust_wal_sender_timeout "$max_flush_lag_ms"
+        if [ "$__OCF_ACTION" = "monitor" ]; then
+            max_flush_lag_ms=$(get_max_flush_lag_ms)
+            if [ -n "$max_flush_lag_ms" ]; then
+                adjust_wal_sender_timeout "$max_flush_lag_ms"
+            fi
         fi
     fi
 ```
@@ -573,12 +559,12 @@ flush_lag から目標の wal_sender_timeout を計算する。
 ```bash
 #
 # Calculate target wal_sender_timeout from flush_lag.
-# Formula: flush_lag * safety_factor (4) -> round up to step values.
+# Formula: flush_lag * safety_factor (2) -> round up to step values.
 # Min: monitor_interval + 1 second (dynamic), Max: 60s.
 #
 calculate_wal_sender_timeout() {
     local flush_lag_ms=$1
-    local safety_factor=4
+    local safety_factor=2
     local calculated_ms
     local calculated_sec
     local target_sec
@@ -702,7 +688,7 @@ flush_lag 履歴ファイルを更新し、平滑化された最大値を返す�
 ```bash
 #
 # Update flush_lag history file and return smoothed max value.
-# History keeps last 5 flush_lag values with timestamps.
+# History keeps last 3 flush_lag values with timestamps.
 # Format: "YYYY-MM-DDTHH:MM:SS value_in_ms" per line.
 #
 update_flush_lag_history() {
@@ -720,10 +706,10 @@ update_flush_lag_history() {
         history=$(cat "$FLUSH_LAG_HISTORY_FILE")
     fi
 
-    # Add new value and keep only last 5
+    # Add new value and keep only last 3
     if [ -n "$history" ]; then
-        # Get last 4 lines and add new one
-        history=$(echo "$history" | tail -4)
+        # Get last 2 lines and add new one
+        history=$(echo "$history" | tail -2)
         history=$(printf "%s\n%s %s" "$history" "$timestamp" "$new_value")
     else
         history="$timestamp $new_value"
@@ -875,8 +861,6 @@ cat /var/lib/pgsql/tmp/flush_lag_history
 2024-12-23T11:24:20 4005
 2024-12-23T11:24:30 4
 2024-12-23T11:30:12 6
-2024-12-23T11:30:21 6
-2024-12-23T11:30:30 0
 ```
 
 ### その他の有益なコマンド
@@ -916,7 +900,7 @@ cat /var/lib/pgsql/tmp/flush_lag_history
 
 1. **pgsql の monitor interval の最適化**: 現在は 9 秒で固定としています。環境によっては短くできる可能性があります。
 
-2. **履歴サンプル数の最適化**: 現在は 5 回としています。環境によっては調整が必要になります。
+2. **履歴サンプル数の最適化**: 現在は 3 回としています。環境によっては調整が必要になります。
 
 ---
 
