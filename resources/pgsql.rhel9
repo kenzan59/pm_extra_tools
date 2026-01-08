@@ -470,11 +470,12 @@ This is optional for replication. Defaults to all nodes in the cluster
 <longdesc lang="en">
 If this is true, RA dynamically adjusts wal_sender_timeout based on
 the observed flush_lag from synchronous standby nodes.
-The adjustment uses the formula: max(flush_lag) * 4 (safety factor),
+The adjustment uses the formula: max(flush_lag) * 2 (safety factor),
 then rounds up to predefined steps.
 The minimum value is dynamically calculated as monitor_interval + 1 second.
 This helps to detect synchronous standby failures more quickly while
 avoiding false positives from normal network latency variations.
+This adjustment is performed only during monitor operations.
 This is optional for replication with sync mode.
 </longdesc>
 <shortdesc lang="en">adjust_wal_sender_timeout</shortdesc>
@@ -1327,13 +1328,13 @@ control_slave_status() {
         set_sync_mode "$target_list"
     fi
 
-    # Adjust wal_sender_timeout if enabled
+    # Adjust wal_sender_timeout if enabled (only during monitor operation)
     if ocf_is_true ${OCF_RESKEY_adjust_wal_sender_timeout}; then
-        # debug log : view OCF_RESKEY_CRM_meta_interval value according to OCF_ACTION value
-        ocf_log info "DEBUG: __OCF_ACTION=$__OCF_ACTION, CRM_meta_interval=${OCF_RESKEY_CRM_meta_interval:-UNSET}"
-        max_flush_lag_ms=$(get_max_flush_lag_ms)
-        if [ -n "$max_flush_lag_ms" ]; then
-            adjust_wal_sender_timeout "$max_flush_lag_ms"
+        if [ "$__OCF_ACTION" = "monitor" ]; then
+            max_flush_lag_ms=$(get_max_flush_lag_ms)
+            if [ -n "$max_flush_lag_ms" ]; then
+                adjust_wal_sender_timeout "$max_flush_lag_ms"
+            fi
         fi
     fi
 
@@ -1378,12 +1379,12 @@ get_max_flush_lag_ms() {
 
 #
 # Calculate target wal_sender_timeout from flush_lag.
-# Formula: flush_lag * safety_factor (4) -> round up to step values.
+# Formula: flush_lag * safety_factor (2) -> round up to step values.
 # Min: monitor_interval + 1 second (dynamic), Max: 60s.
 #
 calculate_wal_sender_timeout() {
     local flush_lag_ms=$1
-    local safety_factor=4
+    local safety_factor=2
     local calculated_ms
     local calculated_sec
     local target_sec
@@ -1489,7 +1490,7 @@ init_wal_sender_timeout_conf() {
 
 #
 # Update flush_lag history file and return smoothed max value.
-# History keeps last 5 flush_lag values with timestamps.
+# History keeps last 3 flush_lag values with timestamps.
 # Format: "YYYY-MM-DDTHH:MM:SS value_in_ms" per line.
 #
 update_flush_lag_history() {
@@ -1507,10 +1508,10 @@ update_flush_lag_history() {
         history=$(cat "$FLUSH_LAG_HISTORY_FILE")
     fi
 
-    # Add new value and keep only last 5
+    # Add new value and keep only last 3
     if [ -n "$history" ]; then
-        # Get last 4 lines and add new one
-        history=$(echo "$history" | tail -4)
+        # Get last 2 lines and add new one
+        history=$(echo "$history" | tail -2)
         history=$(printf "%s\n%s %s" "$history" "$timestamp" "$new_value")
     else
         history="$timestamp $new_value"
