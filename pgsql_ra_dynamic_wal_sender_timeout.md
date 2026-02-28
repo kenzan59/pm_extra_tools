@@ -2,12 +2,12 @@
 
 ## 1. 背景と課題
 
-### 1.1 同期レプリケーションにおける wal_sender_timeout の役割
+### 1.1. 同期レプリケーションにおける wal_sender_timeout の役割
 
 PostgreSQL の同期レプリケーションでは、Primary が WAL（Write-Ahead Log）を Standby に送信し、
 Standby からの応答を待ちます。`wal_sender_timeout` は、この応答が一定時間内に返ってこない場合に、Standby との接続を切断するためのタイムアウト値です。
 
-#### タイムアウト判定の仕組み
+### 1.2. タイムアウト判定の仕組み
 
 `wal_sender_timeout` は、**最後に Standby から応答を受信してからの経過時間**でタイムアウトを判定します。WAL 送信時刻ではなく、応答受信時刻がタイマーの起点となります。
 
@@ -55,11 +55,11 @@ Primary                                       Standby
 
 これにより、トランザクションがない状態でも Standby の障害を検出できます。
 
-### 1.2 wal_sender_timeout と pgsql RA の連携
+### 1.3. wal_sender_timeout と pgsql RA の連携
 
 `wal_sender_timeout` によるタイムアウト検出から、pgsql RA による同期レプリケーション構成の変更までの流れを説明します。
 
-#### 全体の流れ
+#### 1.3.1 全体の流れ
 
 ```
 [1] wal_sender_timeout の期限が過ぎる
@@ -79,7 +79,7 @@ Primary                                       Standby
 [8] PostgreSQL に設定変更を反映する（reload）
 ```
 
-#### 各ステップの詳細
+#### 1.3.2. 各ステップの詳細
 
 **[1] wal_sender_timeout の期限が過ぎる**
 
@@ -143,7 +143,7 @@ synchronous_standby_names = '"standby1"'
 
 pgsql RA は `pg_ctl reload` を実行し、設定変更を PostgreSQL に反映します。
 
-#### 障害検知時間の内訳
+#### 1.3.3. 障害検知時間の内訳
 
 Standby 障害が発生してから、同期レプリケーション構成が変更されるまでの時間は以下の要素で構成されます。
 
@@ -156,7 +156,7 @@ wal_sender_timeout ≦ 障害検知時間 ≦ wal_sender_timeout + monitor inter
 | wal_sender_timeout | PostgreSQL がタイムアウトを検出するまでの時間 | 利用マニュアルでは 20秒（デフォルト値は 60秒） |
 | monitor interval | Pacemaker が monitor 操作を実行する間隔 | 利用マニュアルでは 9秒 |
 
-### 1.3 wal_sender_timeout を動的に変更することの意義
+### 1.4. wal_sender_timeout を動的に変更することの意義
 
 現状、`wal_sender_timeout` は `postgresql.conf` で固定値として設定されています。
 `wal_sender_timeout` を適切な値に設定することで、**レプリケーション通信の故障が発生したときの検知時間を短縮**できます。
@@ -171,7 +171,7 @@ wal_sender_timeout ≦ 障害検知時間 ≦ wal_sender_timeout + monitor inter
 
 ## 2. 設計方針の検討
 
-### 2.1 ping
+### 2.1. ping
 
 レプリケーション通信の状態を監視する方法として、ping（ICMP）を使用することも考えられます。しかし、以下の理由から ping は採用しませんでした。
 
@@ -183,7 +183,7 @@ wal_sender_timeout ≦ 障害検知時間 ≦ wal_sender_timeout + monitor inter
 
 monitor 操作における ping 実行に時間がかかる可能性があり、monitor 処理全体の遅延につながります。
 
-### 2.2 pg_stat_replication テーブルのカラム分析
+### 2.2. pg_stat_replication テーブルのカラム分析
 
 PostgreSQL は `pg_stat_replication` ビューでレプリケーションの状態を公開しています。どのカラムが動的調整の入力として適切かを検討しました。
 
@@ -199,15 +199,15 @@ PostgreSQL は `pg_stat_replication` ビューでレプリケーションの状�
 | `replay_lag` | 適用遅延（interval 型） | 時間として直接利用可能 |
 | `reply_time` | 最後の応答時刻 | 応答がない期間の計測には有用だが、RTT の反映には不向き |
 
-### 2.3 flush_lag
+### 2.3. flush_lag
 
 `flush_lag` は以下の理由から、動的調整の入力として最も適切と判断しました。
 
-#### flush_lag の定義
+#### 2.3.1. flush_lag の定義
 
 > Primary が WAL を送信してから、Standby がその WAL を永続ストレージに flush（fsync）するまでの時間差
 
-#### flush_lag の測定方法
+#### 2.3.2. flush_lag の測定方法
 
 `flush_lag` は **Standby 側で測定された時刻** に基づいて計算されます。PostgreSQL の実装では以下の流れで測定されます。
 
@@ -241,7 +241,7 @@ Primary                                       Standby
 
 なお、この測定方法において、`flush_lag` は Primary と Standby 間の時刻同期に依存します。
 
-#### 採用理由
+#### 2.3.3. 採用理由
 
 1. **同期レプリケーションの完了条件と一致**: 同期レプリケーション（`synchronous_commit = on`）では、Standby が WAL を flush した時点でトランザクションがコミット完了となります。`flush_lag` はこの完了までの時間を直接表します。
 
@@ -249,15 +249,8 @@ Primary                                       Standby
 
 3. **interval 型で取得可能**: PostgreSQL 10 以降、`flush_lag` は interval 型で直接取得でき、ミリ秒単位への変換が容易です。
 
-### 2.4 flush_lag が NULL になるケース
+### 2.4. flush_lag が NULL になるケース
 
-前述の通り、`flush_lag` は以下の計算式で求められます。
-
-```
-flush_lag = T_flush - T_send
-```
-
-しかし、この計算には **WAL 送信が発生している必要があります**。
 Standby が完全に追いついており、新しい WAL 送信がない場合、**しばらくの時間**が経過後、 `flush_lag` は NULL になります。
 
 > If the standby server has entirely caught up with the sending server and there is no more WAL activity, the most recently measured lag times will continue to be displayed **for a short time and then show NULL.**
@@ -274,7 +267,7 @@ Standby が完全に追いついており、新しい WAL 送信がない場合�
 
 ## 3. 提案手法
 
-### 3.1 計算式
+### 3.1. 計算式
 
 `monitor_interval` 間隔で取得可能な各同期 Standby ノードの `flush_lag` の値を入力として、以下の計算式により `wal_sender_timeout` を導出します。
 
@@ -307,11 +300,11 @@ RTT ≒ flush_lag + 帰りのネットワーク遅延 < flush_lag × 2
 
 したがって、`flush_lag × 2` を RTT の上限値として設定しました。
 
-### 3.3 履歴サンプル数
+### 3.3. 履歴サンプル数
 
 3 としました。今回の値と、過去 2 回の履歴をサンプルとしました。
 
-### 3.4 下限値
+### 3.4. 下限値
 
 `wal_sender_timeout` は、Pacemaker の monitor interval より大きい値を設定する必要があります。
 理由は、`wal_sender_timeout` が monitor interval より小さい場合、遅延の急増時に調整が間に合わず、Standby が切断される可能性があるためです。
@@ -321,11 +314,11 @@ RTT ≒ flush_lag + 帰りのネットワーク遅延 < flush_lag × 2
 下限値 = monitor_interval + 1 秒
 ```
 
-### 3.5 上限値
+### 3.5. 上限値
 
 PostgreSQL のデフォルト値である 60 秒を採用しました。
 
-### 3.6 計算例（monitor_interval = 9秒、下限値 = 10秒 の場合）
+### 3.6. 計算例（monitor_interval = 9秒、下限値 = 10秒 の場合）
 
 | flush_lag (最大値) | 計算 | 結果 |
 |-------------------|------|------|
@@ -339,12 +332,12 @@ PostgreSQL のデフォルト値である 60 秒を採用しました。
 | 30000ms | 30000 × 2 = 60000ms | 60秒 |
 | 35000ms | 35000 × 2 = 70000ms | 60秒（上限） |
 
-### 3.7 flush_lag が NULL である場合の動作
+### 3.7. flush_lag が NULL である場合の動作
 
 flush_lag が NULL（Standby が完全に追いついている状態）の場合、履歴に 0 を追加します。
 これにより、一時的なスパイクがあっても、その後通信が安定すれば徐々に下限値に戻ります。
 
-#### 動作例（履歴サンプル数 = 3、下限値 = 10秒）
+#### 3.7.1. 動作例（履歴サンプル数 = 3、下限値 = 10秒）
 
 | 回数 | 履歴 | max | wal_sender_timeout |
 |------|------|-----|-------------------|
@@ -355,48 +348,22 @@ flush_lag が NULL（Standby が完全に追いついている状態）の場合
 
 ---
 
-## 4. Phi-Accrual Failure Detector について
+## 4. 仕様概要
 
-Phi-Accrual Failure Detector は、Cassandra や Akka で使用されている適応型障害検出アルゴリズムです。検討しましたが、以下の理由から採用しませんでした。
-
-**理由 1: 入力データの性質の違い**
-
-| 項目 | Phi-Accrual の想定 | 今回の実装 |
-|------|-------------------|-----------|
-| 入力データ | ハートビート到着間隔 | flush_lag（レプリケーション遅延） |
-| 通信形態 | メッシュ型（多対多） | スター型（1 対多） |
-| サンプル頻度 | 高頻度（秒単位以下） | monitor interval（9秒） |
-
-**理由 2: サンプル数の不足**
-
-Phi-Accrual では統計的に有意な平均・分散を計算するために、数十〜数百のサンプルが必要です。今回の実装では monitor interval が 9秒であり、十分なサンプル数を確保できません。
-
-**理由 3: 正規分布の仮定**
-
-Phi-Accrual はハートビート到着間隔が正規分布に従うことを仮定しています。ネットワーク遅延は一般的にロングテール分布になることが多く、この仮定が成り立たない可能性があります。
-
-**理由 4: 実装の複雑さ**
-
-シェルスクリプト（pgsql RA）での浮動小数点演算や確率計算は複雑であり、デバッグも困難です。
-
----
-
-## 5. 仕様概要
-
-### 5.1. 新規パラメータ
+### 4.1. 新規パラメータ
 
 | パラメータ名 | 型 | デフォルト値 | 説明 |
 |-------------|-----|-------------|------|
 | adjust_wal_sender_timeout | boolean | false | flush_lag に基づく wal_sender_timeout の動的調整を有効化 |
 
-### 5.2. 新規ファイル
+### 4.2. 新規ファイル
 
 | ファイルパス | 説明 |
 |-------------|------|
 | `$OCF_RESKEY_tmpdir/wal_sender_timeout.conf` | wal_sender_timeout の設定ファイル |
 | `$OCF_RESKEY_tmpdir/flush_lag_history` | 直近 3 回の flush_lag 履歴（タイムスタンプ付き） |
 
-### 5.3. 履歴ファイルの形式
+### 4.3. 履歴ファイルの形式
 
 各行は `タイムスタンプ flush_lag（ミリ秒）` の形式です。
 
@@ -406,7 +373,7 @@ Phi-Accrual はハートビート到着間隔が正規分布に従うことを�
 2024-12-23T11:30:12 6
 ```
 
-### 5.4 動作フロー
+### 4.4. 動作フロー
 
 ```
 [Pacemaker monitor 実行]
@@ -430,17 +397,17 @@ Phi-Accrual はハートビート到着間隔が正規分布に従うことを�
 
 ---
 
-## 6. 修正箇所
+## 5. 修正箇所
 
-### 修正1: デフォルト値の追加
+### 5.1. 修正 1: デフォルト値の追加
 
-**場所**: 約76行目付近（既存のデフォルト値定義の後）
+**場所**: 約 76 行目付近（既存のデフォルト値定義の後）
 
 ```bash
 OCF_RESKEY_adjust_wal_sender_timeout_default="false"
 ```
 
-**場所**: 約111行目付近（既存の変数初期化の後）
+**場所**: 約 111 行目付近（既存の変数初期化の後）
 
 ```bash
 : ${OCF_RESKEY_adjust_wal_sender_timeout=${OCF_RESKEY_adjust_wal_sender_timeout_default}}
@@ -448,7 +415,7 @@ OCF_RESKEY_adjust_wal_sender_timeout_default="false"
 
 ---
 
-### 修正2: meta_data() 関数内にパラメータ定義を追加
+### 5.2. 修正 2: meta_data() 関数内にパラメータ定義を追加
 
 **場所**: `</parameters>` タグの直前（external_standby_node_list パラメータの後）
 
@@ -472,7 +439,7 @@ This is optional for replication with sync mode.
 
 ---
 
-### 修正3: pgsql_replication_start() 関数内に初期化処理を追加
+### 5.3. 修正 3: pgsql_replication_start() 関数内に初期化処理を追加
 
 **場所**: `set_async_mode_all` の呼び出し後、`PGSQL_LOCK` チェックの前
 
@@ -486,7 +453,7 @@ This is optional for replication with sync mode.
 
 ---
 
-### 修正4: control_slave_status() 関数の末尾に調整処理を追加
+### 5.4. 修正4: control_slave_status() 関数の末尾に調整処理を追加
 
 **場所**: `return 0` の直前
 
@@ -504,11 +471,11 @@ This is optional for replication with sync mode.
 
 ---
 
-### 修正5: 新しい関数群を追加
+### 5.5. 修正5: 新しい関数群を追加
 
 **場所**: `control_slave_status()` 関数の後
 
-#### get_max_flush_lag_ms()
+#### 5.5.1. get_max_flush_lag_ms()
 
 全同期 Standby ノードから最大の flush_lag（ミリ秒）を取得する。
 
@@ -550,7 +517,7 @@ get_max_flush_lag_ms() {
 }
 ```
 
-#### calculate_wal_sender_timeout()
+#### 5.5.2. calculate_wal_sender_timeout()
 
 flush_lag から目標の wal_sender_timeout を計算する。
 
@@ -596,7 +563,7 @@ calculate_wal_sender_timeout() {
 }
 ```
 
-#### get_current_wal_sender_timeout()
+#### 5.5.3. get_current_wal_sender_timeout()
 
 現在の wal_sender_timeout 値（秒）を取得する。
 
@@ -642,7 +609,7 @@ get_current_wal_sender_timeout() {
 }
 ```
 
-#### init_wal_sender_timeout_conf()
+#### 5.5.4. init_wal_sender_timeout_conf()
 
 wal_sender_timeout.conf を初期化する。
 
@@ -679,7 +646,7 @@ init_wal_sender_timeout_conf() {
 }
 ```
 
-#### update_flush_lag_history()
+#### 5.5.5. update_flush_lag_history()
 
 flush_lag 履歴ファイルを更新し、平滑化された最大値を返す。
 
@@ -728,7 +695,7 @@ update_flush_lag_history() {
 }
 ```
 
-#### adjust_wal_sender_timeout()
+#### 5.5.6. adjust_wal_sender_timeout()
 
 flush_lag に基づいて wal_sender_timeout を調整する。
 
@@ -760,7 +727,7 @@ adjust_wal_sender_timeout() {
 }
 ```
 
-#### set_wal_sender_timeout()
+#### 5.5.7. set_wal_sender_timeout()
 
 wal_sender_timeout 値を設定し、PostgreSQL をリロードする。
 
@@ -784,7 +751,7 @@ set_wal_sender_timeout() {
 
 ---
 
-### 修正6: validate_ocf_check_level_10() 関数内に設定ファイルの include 追加
+### 5.6. 修正 6: validate_ocf_check_level_10() 関数内に設定ファイルの include 追加
 
 **場所**: REP_MODE_CONF の include directive 追加処理の後（約2270行付近）
 
@@ -807,7 +774,7 @@ set_wal_sender_timeout() {
 
 ---
 
-### 修正7: グローバル変数の初期化
+### 5.7. 修正7: グローバル変数の初期化
 
 **場所**: validate_ocf_check_level_10() 関数内、is_replication ブロック内（CHECK_REPLICATION_STATE_SQL 定義の後、約2220行付近）
 
@@ -820,9 +787,9 @@ set_wal_sender_timeout() {
 
 ---
 
-## 7. 動作確認
+## 6. 動作確認
 
-### パラメータ設定
+### 6.1. パラメータ設定
 
 リソース定義に以下を追加:
 
@@ -830,7 +797,7 @@ set_wal_sender_timeout() {
 <nvpair id="pgsql-instance_attributes-adjust_wal_sender_timeout" name="adjust_wal_sender_timeout" value="true"/>
 ```
 
-### ログ確認
+### 6.2. ログ確認
 
 ```bash
 grep -E "(wal_sender_timeout|flush_lag)" /var/log/messages | tail -50
@@ -846,7 +813,7 @@ Dec 23 11:24:30 primary1 pgsql(pgsql)[94110]: INFO: Changing wal_sender_timeout:
 Dec 23 11:30:12 primary1 pgsql(pgsql)[106995]: INFO: Changing wal_sender_timeout: 40s -> 20s (flush_lag=4005ms)
 ```
 
-### ファイル確認
+### 6.3. ファイル確認
 
 ```bash
 cat /var/lib/pgsql/tmp/wal_sender_timeout.conf
@@ -861,7 +828,7 @@ cat /var/lib/pgsql/tmp/flush_lag_history
 2024-12-23T11:30:12 6
 ```
 
-### その他の有益なコマンド
+### 6.4. その他の有益なコマンド
 
 ```bash
 # tc コマンドによる遅延（例では 3000ms）の挿入
@@ -892,7 +859,7 @@ cat /var/lib/pgsql/tmp/flush_lag_history
 
 ---
 
-## 8. 今後の課題
+## 7. 今後の課題
 
 今後、検討が必要な項目は以下の通りです。
 
@@ -902,7 +869,7 @@ cat /var/lib/pgsql/tmp/flush_lag_history
 
 ---
 
-## 9. 参考文献
+## 8. 参考文献
 
 - レプリケーション遅延の監視について（第 40 回PostgreSQLアンカンファレンス@オンライン 発表資料）
   - https://www.slideshare.net/slideshow/postgresql-replication-lags-pgunconf40-nttdata/256567436
