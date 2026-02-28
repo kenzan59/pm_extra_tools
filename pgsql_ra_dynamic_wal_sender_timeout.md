@@ -878,6 +878,3 @@ cat /var/lib/pgsql/tmp/flush_lag_history
   - https://www.postgresql.org/docs/current/monitoring-stats.html#MONITORING-PG-STAT-REPLICATION
 
 - PostgreSQL Source Code: walsender.c
-
-- Database Internals, Chapter 9: Failure Detection
-  - Phi-Accrual Failure Detector の解説
